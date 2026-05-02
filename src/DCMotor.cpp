@@ -1,36 +1,40 @@
 #include "DCMotor.h"
 
-// Initialize static pointer
-DCMotor *DCMotor::instance = nullptr;
+DCMotor* DCMotor::instances[2]  = {nullptr, nullptr};
+int      DCMotor::instanceCount = 0;
 
-DCMotor::DCMotor(int dirPin1, int dirPin2, int enablePin, int encoderPinA, int encoderPinB)
+DCMotor::DCMotor(int dirPin1, int dirPin2, int enablePin,
+                 int encoderPinA, int encoderPinB, int pwmChannel)
     : dirPin1(dirPin1), dirPin2(dirPin2), enablePin(enablePin),
       encoderPinA(encoderPinA), encoderPinB(encoderPinB),
-      encoderCount(0), prevEncoderState(0), commandedSpeed(0), isEnabled(true) {
-  instance = this;
+      pwmChannel(pwmChannel),
+      encoderCount(0), prevEncoderState(0), commandedSpeed(0), isEnabled(true)
+{
+  motorIndex = instanceCount++;
+  if (motorIndex < 2) {
+    instances[motorIndex] = this;
+  }
 }
 
 void DCMotor::begin() {
-  // Configure direction pins as outputs
   pinMode(dirPin1, OUTPUT);
   pinMode(dirPin2, OUTPUT);
-
-  // Configure encoder pins as inputs with pull-ups
   pinMode(encoderPinA, INPUT_PULLUP);
   pinMode(encoderPinB, INPUT_PULLUP);
 
-  // Setup PWM on enable pin
-  ledcSetup(PWM_CHANNEL, PWM_FREQ_HZ, PWM_RESOLUTION_BITS);
-  ledcAttachPin(enablePin, PWM_CHANNEL);
+  ledcSetup(pwmChannel, PWM_FREQ_HZ, PWM_RESOLUTION_BITS);
+  ledcAttachPin(enablePin, pwmChannel);
 
-  // Initialize encoder state
   prevEncoderState = readEncoderState();
 
-  // Attach interrupts
-  attachInterrupt(digitalPinToInterrupt(encoderPinA), onEncoderChangeISR, CHANGE);
-  attachInterrupt(digitalPinToInterrupt(encoderPinB), onEncoderChangeISR, CHANGE);
+  if (motorIndex == 0) {
+    attachInterrupt(digitalPinToInterrupt(encoderPinA), isr0, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(encoderPinB), isr0, CHANGE);
+  } else {
+    attachInterrupt(digitalPinToInterrupt(encoderPinA), isr1, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(encoderPinB), isr1, CHANGE);
+  }
 
-  // Start with motor stopped
   setSpeed(0);
 }
 
@@ -39,25 +43,22 @@ void DCMotor::setSpeed(int speed) {
   commandedSpeed = speed;
 
   if (!isEnabled) {
-    ledcWrite(PWM_CHANNEL, 0);
+    ledcWrite(pwmChannel, 0);
     return;
   }
 
   if (speed > 0) {
-    // Forward
     digitalWrite(dirPin1, HIGH);
     digitalWrite(dirPin2, LOW);
-    ledcWrite(PWM_CHANNEL, speed);
+    ledcWrite(pwmChannel, speed);
   } else if (speed < 0) {
-    // Reverse
     digitalWrite(dirPin1, LOW);
     digitalWrite(dirPin2, HIGH);
-    ledcWrite(PWM_CHANNEL, -speed);
+    ledcWrite(pwmChannel, -speed);
   } else {
-    // Stop
     digitalWrite(dirPin1, LOW);
     digitalWrite(dirPin2, LOW);
-    ledcWrite(PWM_CHANNEL, 0);
+    ledcWrite(pwmChannel, 0);
   }
 }
 
@@ -77,7 +78,7 @@ void DCMotor::resetEncoder() {
 void DCMotor::enable(bool en) {
   isEnabled = en;
   if (!isEnabled) {
-    ledcWrite(PWM_CHANNEL, 0);
+    ledcWrite(pwmChannel, 0);
   } else {
     setSpeed(commandedSpeed);
   }
@@ -89,22 +90,23 @@ uint8_t DCMotor::readEncoderState() const {
   return static_cast<uint8_t>((a << 1) | b);
 }
 
-void IRAM_ATTR DCMotor::onEncoderChangeISR() {
-  if (instance != nullptr) {
-    instance->onEncoderChange();
-  }
+void IRAM_ATTR DCMotor::isr0() {
+  if (instances[0]) instances[0]->onEncoderChange();
+}
+
+void IRAM_ATTR DCMotor::isr1() {
+  if (instances[1]) instances[1]->onEncoderChange();
 }
 
 void DCMotor::onEncoderChange() {
-  // Transition table for quadrature decoding
   static const int8_t table[16] = {
-      0, -1, 1, 0,
-      1, 0, 0, -1,
-      -1, 0, 0, 1,
-      0, 1, -1, 0};
-
+       0, -1,  1,  0,
+       1,  0,  0, -1,
+      -1,  0,  0,  1,
+       0,  1, -1,  0
+  };
   uint8_t newState = readEncoderState();
-  uint8_t idx = static_cast<uint8_t>((prevEncoderState << 2) | newState);
-  encoderCount += table[idx];
+  uint8_t idx      = static_cast<uint8_t>((prevEncoderState << 2) | newState);
+  encoderCount    += table[idx];
   prevEncoderState = newState;
 }
