@@ -2,14 +2,27 @@
 #include "DCMotor.h"
 
 // ── Hardware config ────────────────────────────────────────────────────────
-// Left motor:  dir=GPIO18/19  enable=GPIO21  encoder=GPIO22/23  pwm_ch=0
-// Right motor: dir=GPIO25/26  enable=GPIO27  encoder=GPIO32/33  pwm_ch=1
-DCMotor motorL(18, 19, 21, 22, 23, 0);
-DCMotor motorR(25, 26, 27, 32, 33, 1);
+// Left motor:  dir=GPIO19/18  enable=GPIO21  encoder=GPIO22/23  pwm_ch=0  (dir pins swapped to fix inverted direction)
+// Right motor: dir=GPIO13/12  enable=GPIO14  encoder=GPIO32/33  pwm_ch=1
+DCMotor motorL(19, 18, 21, 22, 23, 0);
+DCMotor motorR(13, 12, 14, 32, 33, 1);
 
 // ── Encoder / kinematics placeholders ─────────────────────────────────────
 // TODO: set to (encoder CPR) × (gear ratio) for your motor
 static constexpr float TICKS_PER_REV = 1440.0f;
+
+// ── Dead-band compensation ─────────────────────────────────────────────────
+// Minimum PWM needed to overcome friction and actually move each motor.
+// TODO: tune by slowly increasing from 0 until each motor just barely starts spinning.
+static constexpr int PWM_DEADBAND_L = 30;   // TODO: tune per motor
+static constexpr int PWM_DEADBAND_R = 30;   // TODO: tune per motor
+
+// Pushes a PID output past the motor's dead-band while keeping 0 as true stop.
+int applyDeadband(int pwm, int deadband) {
+  if (pwm == 0) return 0;
+  return pwm > 0 ? constrain(pwm + deadband, 0, 255)
+                 : constrain(pwm - deadband, -255, 0);
+}
 
 // ── Control loop timing ────────────────────────────────────────────────────
 static constexpr uint32_t CONTROL_INTERVAL_MS = 50;   // 20 Hz
@@ -22,11 +35,11 @@ volatile float targetRpmR = 0.0f;
 // ── PID state ─────────────────────────────────────────────────────────────
 struct PID {
   float kp = 1.5f;   // TODO: tune
-  float ki = 0.5f;   // TODO: tune
+  float ki = 0.1f;   // lowered to prevent windup during stall
   float kd = 0.05f;  // TODO: tune
   float integral  = 0.0f;
   float prevError = 0.0f;
-  static constexpr float INTEGRAL_LIMIT = 200.0f;
+  static constexpr float INTEGRAL_LIMIT = 50.0f;  // tighter cap
 
   int compute(float target, float current, float dt) {
     float error    = target - current;
@@ -119,13 +132,19 @@ void loop() {
     pidL.reset();
     pidR.reset();
   } else {
-    motorL.setSpeed(pidL.compute(tL, currentRpmL, dt));
-    motorR.setSpeed(pidR.compute(tR, currentRpmR, dt));
+    motorL.setSpeed(applyDeadband(pidL.compute(tL, currentRpmL, dt), PWM_DEADBAND_L));
+    motorR.setSpeed(applyDeadband(pidR.compute(tR, currentRpmR, dt), PWM_DEADBAND_R));
   }
 
-  // Send encoder feedback to ROS2
+  // Send encoder feedback to ROS2 (keep format strict for parser)
   Serial.print("E:");
   Serial.print(ticksL);
   Serial.print(":");
   Serial.println(ticksR);
+
+  // Debug line: current RPM (visible in [RAW] log, ignored by parser)
+  Serial.print("D:rpm=");
+  Serial.print(currentRpmL, 1);
+  Serial.print(":");
+  Serial.println(currentRpmR, 1);
 }
