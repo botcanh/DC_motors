@@ -2,37 +2,39 @@
 #include "DCMotor.h"
 
 // ── Hardware config ────────────────────────────────────────────────────────
-// Left motor:  dir=GPIO19/18  enable=GPIO21  encoder=GPIO22/23  pwm_ch=0  (dir pins swapped to fix inverted direction)
-// Right motor: dir=GPIO13/12  enable=GPIO14  encoder=GPIO32/33  pwm_ch=1
-DCMotor motorL(19, 18, 21, 22, 23, 0);
-DCMotor motorR(13, 12, 14, 32, 33, 1);
+// Left motor:  dir=GPIO13/12  enable=GPIO14  encoder=GPIO32/33  pwm_ch=0
+// Right motor: dir=GPIO19/18  enable=GPIO21  encoder=GPIO22/23  pwm_ch=1  (dir pins swapped to fix inverted direction)
+// L/R pin sets swapped (2026-10-25): turning was mirrored -- the GPIO19/18 motor is physically on the right.
+DCMotor motorL(13, 12, 14, 32, 33, 0);
+DCMotor motorR(19, 18, 21, 22, 23, 1);
 
-// ── Encoder / kinematics placeholders ─────────────────────────────────────
-// TODO: set to (encoder CPR) × (gear ratio) for your motor
-static constexpr float TICKS_PER_REV = 1440.0f;
+// ── Encoder / kinematics ──────────────────────────────────────────────────
+// 12V 333RPM gearmotor: 11 pulses/channel/motor-rev, x4 quadrature decoding
+// (both edges of A and B) = 44 counts/motor-rev, x 1:30 gearbox = 1320.
+// Verify by turning a wheel 10 revs by hand. Must match odom_node.py.
+static constexpr float TICKS_PER_REV = 1320.0f;
 
-// ── Dead-band compensation ─────────────────────────────────────────────────
-// Measured via `sweep` in arduino_pi_serial.py with motors cold: L≈138, R≈144.
-// Batteries are weak right now (low pack voltage -> low torque at low PWM),
-// so the real stiction point is much higher than a healthy 30. +4 margin.
-static constexpr int PWM_DEADBAND_L = 142;
-static constexpr int PWM_DEADBAND_R = 148;
+// ── Motor model (333RPM motors, 12V pack, wheels free) ─────────────────────
+// Breakaway: `sweep both 100 2` -> a stopped wheel starts at L≈98, R≈98 (+4).
+static constexpr int PWM_BREAKAWAY_L = 102;
+static constexpr int PWM_BREAKAWAY_R = 102;
+// Once turning, friction is much lower (still spins at PWM 70). Steady-state
+// PWM-vs-RPM fit over PWM 70..160: pwm ≈ offset + kf*rpm (max err ~4 PWM).
+// L runs ~15-20 RPM faster than R at equal PWM, hence per-wheel offsets
+// (values follow the physical motor -- swapped along with the pins above).
+// Driver voltage drop means P:255 only reaches ~257 RPM.
+static constexpr float FF_OFFSET_L = 39.0f;
+static constexpr float FF_OFFSET_R = 51.0f;
+static constexpr float FF_KF_L     = 0.70f;
+static constexpr float FF_KF_R     = 0.71f;
 
-// Pushes a PID output past the motor's dead-band -- but only when the
-// commanded direction agrees with (or the motor is near-stopped relative
-// to) the current direction of motion. On this weak-battery rig, sustaining
-// motion takes nearly as much PWM as starting it, so the boost must stay on
-// while accelerating/holding in the same direction. It only needs to drop
-// out when the PID is asking to brake/reverse against current motion --
-// inflating a small braking correction by the full deadband would turn a
-// gentle trim into a near-full-power reversal (the dip seen while tuning).
-int applyDeadband(int pwm, int deadband, float currentRpm) {
+// The feedforward offset assumes the wheel is already turning. A stopped
+// wheel needs the higher breakaway PWM to get going, so bump up to it until
+// it moves (only in the commanded direction; braking/reversing is untouched).
+int applyBreakaway(int pwm, int breakaway, float currentRpm) {
   if (pwm == 0) return 0;
-  bool sameDirection = (pwm > 0 && currentRpm > -3.0f) ||
-                       (pwm < 0 && currentRpm <  3.0f);
-  if (sameDirection) {
-    return pwm > 0 ? constrain(pwm + deadband, 0, 255)
-                   : constrain(pwm - deadband, -255, 0);
+  if (fabsf(currentRpm) < 3.0f && abs(pwm) < breakaway) {
+    return pwm > 0 ? breakaway : -breakaway;
   }
   return constrain(pwm, -255, 255);
 }
@@ -47,22 +49,25 @@ volatile float targetRpmR = 0.0f;
 
 // ── PID state ─────────────────────────────────────────────────────────────
 struct PID {
-  // Scaled down vs the old kp=1.5: with deadband ~142-148, the proportional
-  // term only has ~110 PWM of headroom left (255-145) instead of ~225, so the
-  // same kp would snap straight to near-full power on small errors.
-  float kp = 0.886f;   // TODO: tune
-  float ki = 0.592f;  // lowered slightly; deadband kick already does most of the work
-  float kd = 0.013f;  // raised a bit for extra damping against the bigger PWM jump
+  // Feedforward (offset + kf*target) gets close to the target immediately;
+  // kp/ki only trim the residual and the extra load on the ground.
+  float ffOffset;
+  float kf;
+  // Tuned in air (step test 30/60/120/-60 RPM): settles within ~1 RPM,
+  // ~10% overshoot, t90 0.15-0.55 s. Re-check on the ground (expect more ki).
+  float kp = 0.5f;
+  float ki = 3.0f;
+  float kd = 0.0f;
   float integral  = 0.0f;
   float prevError = 0.0f;
-  // Was 50 -- too tight. With deadband ~145, ki needs real headroom to
-  // supply enough sustained torque at higher RPM (weak battery -> more sag
-  // under load), or steady-state error never closes no matter how high kp
-  // goes. 200 gives up to ki*200 of sustained push instead of ki*50.
+  // Gives up to ki*200 of sustained push -- headroom for ground load that
+  // the in-air feedforward fit doesn't account for.
   static constexpr float INTEGRAL_LIMIT = 200.0f;
   // Errors smaller than this are treated as zero so the controller doesn't
-  // dither right at the PWM deadband boundary (commanding ~145 then 0 then ~145...).
+  // dither on single-tick encoder quantisation (~0.9 RPM per tick at 20 Hz).
   static constexpr float ERROR_DEADBAND_RPM = 2.0f;
+
+  PID(float ffOffset, float kf) : ffOffset(ffOffset), kf(kf) {}
 
   int compute(float target, float current, float dt) {
     float error = target - current;
@@ -70,14 +75,17 @@ struct PID {
     integral       = constrain(integral + error * dt, -INTEGRAL_LIMIT, INTEGRAL_LIMIT);
     float deriv    = (error - prevError) / dt;
     prevError      = error;
-    float out      = kp * error + ki * integral + kd * deriv;
+    float ff       = (target > 0.0f ? ffOffset : target < 0.0f ? -ffOffset : 0.0f)
+                     + kf * target;
+    float out      = ff + kp * error + ki * integral + kd * deriv;
     return constrain((int)out, -255, 255);
   }
 
   void reset() { integral = 0.0f; prevError = 0.0f; }
 };
 
-PID pidL, pidR;
+PID pidL(FF_OFFSET_L, FF_KF_L);
+PID pidR(FF_OFFSET_R, FF_KF_R);
 
 // Encoder counts saved between control ticks for RPM calculation
 long prevTicksL = 0;
@@ -86,13 +94,22 @@ long prevTicksR = 0;
 // ── Serial protocol ────────────────────────────────────────────────────────
 // RX  "C:<left_rpm>:<right_rpm>\n"   e.g.  C:45.0:-20.5   (PID mode)
 // RX  "P:<left_pwm>:<right_pwm>\n"  e.g.  P:40:40        (direct PWM, bypasses PID)
-// RX  "K:<kp>:<ki>:<kd>\n"          e.g.  K:0.8:0.08:0.08 (live PID gain update, both motors)
+// RX  "K:<kp>:<ki>:<kd>[:<kf>]\n"   e.g.  K:0.3:1.5:0:0.7 (live gain update, both motors;
+//                                   kf optional -- if omitted each wheel keeps its own)
 // TX  "E:<left_ticks>:<right_ticks>\n"  e.g.  E:1234:-56
-// TX  "K:ack:<kp>:<ki>:<kd>\n"      acks a gain update
+// TX  "K:ack:<kp>:<ki>:<kd>:<kfL>:<kfR>\n" acks a gain update
 
 volatile bool directMode = false;
 volatile int  directPwmL = 0;
 volatile int  directPwmR = 0;
+
+// The bridge re-sends C: at 20 Hz (same rate as the control loop), so
+// resetting on every message would wipe the integral each tick. Only reset
+// when starting from stop or reversing direction.
+static bool needsPidReset(float oldTarget, float newTarget) {
+  return oldTarget == 0.0f || newTarget == 0.0f ||
+         (oldTarget > 0.0f) != (newTarget > 0.0f);
+}
 
 void parseCommand(const String& line) {
   if (line.startsWith("C:")) {
@@ -101,12 +118,15 @@ void parseCommand(const String& line) {
     float l = line.substring(2, sep).toFloat();
     float r = line.substring(sep + 1).toFloat();
     noInterrupts();
+    bool  wasDirect = directMode;
+    float oldL      = targetRpmL;
+    float oldR      = targetRpmR;
     directMode = false;
     targetRpmL = l;
     targetRpmR = r;
     interrupts();
-    pidL.reset();
-    pidR.reset();
+    if (wasDirect || needsPidReset(oldL, l)) pidL.reset();
+    if (wasDirect || needsPidReset(oldR, r)) pidR.reset();
 
   } else if (line.startsWith("P:")) {
     int sep = line.indexOf(':', 2);
@@ -124,12 +144,17 @@ void parseCommand(const String& line) {
     if (sep1 < 0) return;
     int sep2 = line.indexOf(':', sep1 + 1);
     if (sep2 < 0) return;
+    int sep3 = line.indexOf(':', sep2 + 1);
     float kp = line.substring(2, sep1).toFloat();
     float ki = line.substring(sep1 + 1, sep2).toFloat();
-    float kd = line.substring(sep2 + 1).toFloat();
+    float kd = line.substring(sep2 + 1, sep3 < 0 ? line.length() : sep3).toFloat();
 
     pidL.kp = kp; pidL.ki = ki; pidL.kd = kd;
     pidR.kp = kp; pidR.ki = ki; pidR.kd = kd;
+    if (sep3 >= 0) {
+      float kf = line.substring(sep3 + 1).toFloat();
+      pidL.kf = kf; pidR.kf = kf;
+    }
     pidL.reset();
     pidR.reset();
 
@@ -138,7 +163,11 @@ void parseCommand(const String& line) {
     Serial.print(":");
     Serial.print(ki, 3);
     Serial.print(":");
-    Serial.println(kd, 3);
+    Serial.print(kd, 3);
+    Serial.print(":");
+    Serial.print(pidL.kf, 3);
+    Serial.print(":");
+    Serial.println(pidR.kf, 3);
   }
 }
 
@@ -202,8 +231,8 @@ void loop() {
     pidL.reset();
     pidR.reset();
   } else {
-    motorL.setSpeed(applyDeadband(pidL.compute(tL, currentRpmL, dt), PWM_DEADBAND_L, currentRpmL));
-    motorR.setSpeed(applyDeadband(pidR.compute(tR, currentRpmR, dt), PWM_DEADBAND_R, currentRpmR));
+    motorL.setSpeed(applyBreakaway(pidL.compute(tL, currentRpmL, dt), PWM_BREAKAWAY_L, currentRpmL));
+    motorR.setSpeed(applyBreakaway(pidR.compute(tR, currentRpmR, dt), PWM_BREAKAWAY_R, currentRpmR));
   }
 
   // Send encoder feedback to ROS2 (keep format strict for parser)
